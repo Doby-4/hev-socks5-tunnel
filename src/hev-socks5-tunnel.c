@@ -32,6 +32,7 @@
 #include "hev-config.h"
 #include "hev-logger.h"
 #include "hev-tunnel.h"
+#include "hev-tunnel-output.h"
 #include "hev-compiler.h"
 #include "hev-mapped-dns.h"
 #include "hev-config-const.h"
@@ -86,10 +87,11 @@ netif_output_handler (struct netif *netif, struct pbuf *p)
 
     s = hev_tunnel_write (tun_fd, p);
     if (s <= 0) {
-        if (errno == EAGAIN)
-            return ERR_WOULDBLOCK;
-        LOG_W ("socks5 tunnel write");
-        return ERR_IF;
+        int error = errno;
+        err_t result = hev_tunnel_output_error (error);
+        if (result == ERR_IF)
+            LOG_W ("socks5 tunnel write: errno %d", error);
+        return result;
     }
 
     stat_rx_packets++;

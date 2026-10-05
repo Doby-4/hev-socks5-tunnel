@@ -10,6 +10,7 @@
 #ifndef __HEV_TUNNEL_H__
 #define __HEV_TUNNEL_H__
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <lwip/pbuf.h>
@@ -90,8 +91,14 @@ hev_tunnel_write (int fd, struct pbuf *buf)
     }
 
     res = writev (fd, iov, i);
-    if (res <= (ssize_t)sizeof (type))
+    if (res < 0)
         return -1;
+    if (res != (ssize_t)(sizeof (type) + buf->tot_len)) {
+        /* Packet writes must be atomic; never classify a short write using
+         * errno left over from an earlier syscall. */
+        errno = EIO;
+        return -1;
+    }
 
     return res;
 }

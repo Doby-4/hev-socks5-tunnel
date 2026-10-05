@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <lwip/tcp.h>
 
@@ -82,52 +83,124 @@ tcp_splice_f (HevSocks5SessionTCP *self)
     return res;
 }
 
+static uint64_t
+tcp_monotonic_ms (void)
+{
+    struct timespec ts;
+    clock_gettime (CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int
+tcp_retry_expired (HevSocks5SessionTCP *self)
+{
+    int timeout = HEV_SOCKS5 (self)->timeout;
+    return timeout == 0 ||
+           (self->retry_pending && timeout > 0 &&
+            tcp_monotonic_ms () - self->retry_started_ms >= (uint64_t)timeout);
+}
+
+/* Called by the existing lwIP slow timer, under the core mutex. It only
+ * wakes the session; socket reads and coroutine waits never run in lwIP. */
+static err_t
+tcp_retry_poll (void *arg, struct tcp_pcb *pcb)
+{
+    HevSocks5SessionTCP *self = arg;
+    (void)pcb;
+    if (self->retry_pending) {
+        if (tcp_retry_expired (self))
+            self->tcp_failed = 1;
+        hev_task_wakeup (self->data.task);
+    }
+    return ERR_OK;
+}
+
 static int
 tcp_splice_b (HevSocks5SessionTCP *self)
 {
     struct iovec iov[2];
-    err_t err = ERR_OK;
-    int res = 1, iovc;
+    int res = 0, iovc, retry = 0;
+
+    if (self->tcp_failed || tcp_retry_expired (self)) {
+        self->tcp_failed = 1;
+        return -1;
+    }
 
     iovc = hev_ring_buffer_writing (self->buffer, iov);
-    if (iovc) {
+    if (iovc && !self->socks_eof) {
         ssize_t s = readv (HEV_SOCKS5 (self)->fd, iov, iovc);
-        if (0 >= s) {
-            if ((0 > s) && (EAGAIN == errno))
-                res = 0;
-            else
-                res = -1;
+        if (s < 0) {
+            if (errno == EINTR)
+                retry = 1;
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                self->tcp_failed = 1;
+                return -1;
+            }
+        } else if (s == 0) {
+            self->socks_eof = 1;
         } else {
             hev_ring_buffer_write_finish (self->buffer, s);
+            res = 1;
         }
-    } else {
-        res = 0;
     }
 
     hev_task_mutex_lock (self->mutex);
     if (self->pcb) {
+        err_t err;
+        int i, submitted = 0;
         iovc = hev_ring_buffer_reading (self->buffer, iov);
-        if (iovc) {
-            ssize_t s = 0;
-            int i;
-            for (i = 0; i < iovc; i++) {
-                void *ptr = iov[i].iov_base;
-                size_t len = iov[i].iov_len;
-                err |= tcp_write (self->pcb, ptr, len, 0);
-                s += len;
+        for (i = 0; i < iovc; i++) {
+            size_t len = iov[i].iov_len;
+            if (len > tcp_sndbuf (self->pcb))
+                len = tcp_sndbuf (self->pcb);
+            if (!len) {
+                retry = 1;
+                break;
             }
-            hev_ring_buffer_read_finish (self->buffer, s);
-            err |= tcp_output (self->pcb);
+            err = tcp_write (self->pcb, iov[i].iov_base, len, 0);
+            if (err != ERR_OK) {
+                if (err == ERR_MEM)
+                    retry = 1;
+                else
+                    self->tcp_failed = 1;
+                break;
+            }
+            /* No-copy: submitted bytes stay allocated until tcp_sent_handler.
+             * A rejected tcp_write consumes nothing, including across wrap. */
+            hev_ring_buffer_read_finish (self->buffer, len);
+            submitted = 1;
             res = 1;
-        } else if (res < 0) {
-            tcp_shutdown (self->pcb, 0, 1);
+            if (len < iov[i].iov_len) {
+                retry = 1;
+                break;
+            }
         }
+        if (!self->tcp_failed && (submitted || self->retry_pending)) {
+            err = tcp_output (self->pcb);
+            if (err == ERR_WOULDBLOCK || err == ERR_MEM)
+                retry = 1;
+            else if (err != ERR_OK)
+                self->tcp_failed = 1;
+        }
+        if (!self->tcp_failed && !retry && self->socks_eof &&
+            !hev_ring_buffer_reading (self->buffer, iov)) {
+            err = tcp_shutdown (self->pcb, 0, 1);
+            if (err == ERR_OK)
+                res = -1; /* EOF, not a failure: drain submitted bytes below. */
+            else if (err == ERR_MEM)
+                retry = 1;
+            else
+                self->tcp_failed = 1;
+        }
+    } else {
+        self->tcp_failed = 1;
     }
+    if (retry && !self->retry_pending)
+        self->retry_started_ms = tcp_monotonic_ms ();
+    self->retry_pending = retry;
     hev_task_mutex_unlock (self->mutex);
-    if (!self->pcb || (err != ERR_OK))
-        res = -1;
 
-    return res;
+    return self->tcp_failed ? -1 : res;
 }
 
 static err_t
@@ -154,6 +227,9 @@ tcp_sent_handler (void *arg, struct tcp_pcb *pcb, u16_t len)
     HevSocks5SessionTCP *self = arg;
 
     hev_ring_buffer_read_release (self->buffer, len);
+    /* Only real progress refreshes the retry deadline, never poll wakeups. */
+    if (len && self->retry_pending)
+        self->retry_started_ms = tcp_monotonic_ms ();
     hev_task_wakeup (self->data.task);
 
     return ERR_OK;
@@ -207,13 +283,22 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
     if (!self->buffer)
         return;
 
+    hev_task_mutex_lock (self->mutex);
+    if (self->pcb)
+        tcp_poll (self->pcb, tcp_retry_poll, 1);
+    hev_task_mutex_unlock (self->mutex);
+
     for (;;) {
         HevTaskYieldType type;
 
+        if (self->tcp_failed || !self->pcb || HEV_SOCKS5 (self)->timeout == 0)
+            break;
         if (res_f >= 0)
             res_f = tcp_splice_f (self);
         if (res_b >= 0)
             res_b = tcp_splice_b (self);
+        if (self->tcp_failed)
+            break;
 
         if (res_f > 0 || res_b > 0)
             type = HEV_TASK_YIELD;
@@ -222,17 +307,34 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
         else
             break;
 
-        if (task_io_yielder (type, base) < 0)
+        if (task_io_yielder (type, base) < 0) {
+            self->tcp_failed = 1;
             break;
+        }
     }
 
-    while (self->pcb) {
+    while (self->pcb && !self->tcp_failed && HEV_SOCKS5 (self)->timeout != 0) {
         if (hev_ring_buffer_get_use_size (self->buffer) == 0)
             break;
 
         if (task_io_yielder (HEV_TASK_WAITIO, base) < 0)
             break;
     }
+
+    /* buffer lives on this coroutine's stack. Drop lwIP's no-copy references
+     * and callbacks BEFORE returning (also on cancellation/fatal errors). */
+    hev_task_mutex_lock (self->mutex);
+    if (self->pcb) {
+        tcp_recv (self->pcb, NULL);
+        tcp_sent (self->pcb, NULL);
+        tcp_err (self->pcb, NULL);
+        tcp_poll (self->pcb, NULL, 0);
+        tcp_abort (self->pcb);
+        self->pcb = NULL;
+    }
+    self->buffer = NULL;
+    self->retry_pending = 0;
+    hev_task_mutex_unlock (self->mutex);
 }
 
 static HevTask *
@@ -302,6 +404,7 @@ hev_socks5_session_tcp_destruct (HevObject *base)
         tcp_recv (self->pcb, NULL);
         tcp_sent (self->pcb, NULL);
         tcp_err (self->pcb, NULL);
+        tcp_poll (self->pcb, NULL, 0);
         tcp_abort (self->pcb);
     }
 
