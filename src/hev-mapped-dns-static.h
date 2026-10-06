@@ -1,5 +1,5 @@
-/* Offline, single-domain policy for the first selective mapped-DNS experiment.
- * Not yet connected to the tunnel's legacy mapped-DNS handler. */
+/* Pure single-domain policy for the selective mapped-DNS experiment.
+ * Used by HevMappedDNS's opt-in fixed mode; this module itself has no I/O. */
 #ifndef __HEV_MAPPED_DNS_STATIC_H__
 #define __HEV_MAPPED_DNS_STATIC_H__
 

@@ -13,6 +13,7 @@
 #include <hev-list.h>
 #include <hev-rbtree.h>
 #include <hev-object.h>
+#include "hev-mapped-dns-static.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,8 @@ struct _HevMappedDNS
     int max;
     int net;
     int mask;
+    /* Nonempty name selects immutable static mode; no LRU records are used. */
+    HevMappedDNSStatic policy;
 
     HevList list;
     HevRBTree tree;
@@ -50,6 +53,10 @@ HevObjectClass *hev_mapped_dns_class (void);
 int hev_mapped_dns_construct (HevMappedDNS *self, int net, int mask, int max);
 
 HevMappedDNS *hev_mapped_dns_new (int net, int mask, int max);
+HevMappedDNS *hev_mapped_dns_new_static (int net, int mask,
+                                        const HevMappedDNSStatic *policy);
+/* Only static mode reserves unknown addresses against real-IP fallback. */
+int hev_mapped_dns_is_reserved (const HevMappedDNS *self, int ip);
 
 HevMappedDNS *hev_mapped_dns_get (void);
 void hev_mapped_dns_put (HevMappedDNS *self);

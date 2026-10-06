@@ -186,6 +186,18 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
     if (!READ_ONCE (run))
         return ERR_RST;
 
+    if (IP_IS_V4_VAL (pcb->local_ip)) {
+        HevMappedDNS *dns = hev_mapped_dns_get ();
+        int address = ntohl (ip_2_ip4 (&pcb->local_ip)->addr);
+        /* Includes the experimental UDP-only DNS endpoint. Do not keep
+         * retrying this as an allocation failure or send it to SOCKS. */
+        if (hev_mapped_dns_is_reserved (dns, address) &&
+            !hev_mapped_dns_lookup (dns, address)) {
+            tcp_abort (pcb);
+            return ERR_ABRT;
+        }
+    }
+
     tcp = hev_socks5_session_tcp_new (pcb, &mutex);
     if (!tcp)
         return ERR_MEM;
@@ -212,15 +224,29 @@ dns_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     HevMappedDNS *dns = arg;
     struct pbuf *b;
+    struct pbuf *query;
     int res;
 
     LOG_D ("%p mapped dns handle", dns);
 
+    /* A UDP datagram can span multiple pbufs. Never parse only its first part.
+     * Keep request and response separate: the legacy parser mutates requests. */
+    if (!p || p->tot_len > 4096)
+        goto exit;
+    query = pbuf_alloc (PBUF_RAW, p->tot_len, PBUF_RAM);
+    if (!query)
+        goto exit;
+    if (pbuf_copy (query, p) != ERR_OK) {
+        pbuf_free (query);
+        goto exit;
+    }
     b = pbuf_alloc (PBUF_TRANSPORT, UDP_BUF_SIZE, PBUF_RAM);
+    if (b)
+        res = hev_mapped_dns_handle (dns, query->payload, query->tot_len,
+                                     b->payload, b->len);
+    pbuf_free (query);
     if (!b)
         goto exit;
-
-    res = hev_mapped_dns_handle (dns, p->payload, p->len, b->payload, b->len);
     if (res < 0)
         goto free;
 
@@ -231,7 +257,8 @@ dns_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 free:
     pbuf_free (b);
 exit:
-    pbuf_free (p);
+    if (p)
+        pbuf_free (p);
     udp_recv (pcb, NULL, NULL);
     udp_remove (pcb);
 }
@@ -253,7 +280,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     dns = hev_mapped_dns_get ();
     if (dns && addr->type == IPADDR_TYPE_V4) {
-        int faddr = hev_config_get_mapdns_address ();
+        uint32_t faddr = hev_config_get_mapdns_address ();
         int fport = hev_config_get_mapdns_port ();
         if (fport == port && faddr == ip_2_ip4 (addr)->addr) {
             udp_recv (pcb, dns_recv_handler, dns);
@@ -624,15 +651,17 @@ mapped_dns_init (void)
     int cache_size;
     int network;
     int netmask;
+    const HevMappedDNSStatic *policy = hev_config_get_mapdns_static ();
 
     network = hev_config_get_mapdns_network ();
     netmask = hev_config_get_mapdns_netmask ();
     cache_size = hev_config_get_mapdns_cache_size ();
 
-    if (!cache_size)
+    if (!cache_size && !policy)
         return 0;
 
-    dns = hev_mapped_dns_new (network, netmask, cache_size);
+    dns = policy ? hev_mapped_dns_new_static (network, netmask, policy) :
+                   hev_mapped_dns_new (network, netmask, cache_size);
     if (!dns)
         return -1;
 

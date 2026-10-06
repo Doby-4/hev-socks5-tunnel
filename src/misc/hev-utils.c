@@ -109,6 +109,8 @@ hev_socks5_addr_from_lwip (HevSocks5Addr *addr, const ip_addr_t *ip, u16_t port)
             name = hev_mapped_dns_lookup (dns, ntohl (ip_2_ip4 (ip)->addr));
         if (name)
             hev_socks5_addr_from_name (addr, name, htons (port));
+        else if (hev_mapped_dns_is_reserved (dns, ntohl (ip_2_ip4 (ip)->addr)))
+            return -1;
         else
             hev_socks5_addr_from_ipv4 (addr, ip, htons (port));
         return 0;

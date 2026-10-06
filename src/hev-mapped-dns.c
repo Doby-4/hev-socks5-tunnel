@@ -68,6 +68,36 @@ hev_mapped_dns_get (void)
     return singleton;
 }
 
+HevMappedDNS *
+hev_mapped_dns_new_static (int net, int mask, const HevMappedDNSStatic *policy)
+{
+    HevMappedDNSStatic checked;
+    HevMappedDNS *self;
+    uint32_t address;
+    uint32_t hostmask = ~(uint32_t)mask;
+
+    if (!policy || !mask || (hostmask & (hostmask + 1)) ||
+        ((uint32_t)net & hostmask) ||
+        hev_mapped_dns_static_init (&checked, policy->name, policy->address) < 0)
+        return NULL;
+    memcpy (&address, checked.address, 4);
+    address = ntohl (address);
+    if ((address & (uint32_t)mask) != (uint32_t)net ||
+        address == (uint32_t)net || address == ((uint32_t)net | hostmask))
+        return NULL;
+
+    self = hev_mapped_dns_new (net, mask, 0);
+    if (self)
+        self->policy = checked;
+    return self;
+}
+
+int
+hev_mapped_dns_is_reserved (const HevMappedDNS *self, int ip)
+{
+    return self && self->policy.name[0] && (ip & self->mask) == self->net;
+}
+
 void
 hev_mapped_dns_put (HevMappedDNS *self)
 {
@@ -175,6 +205,25 @@ write_u32 (uint8_t *p, uint32_t v)
     p[3] = v;
 }
 
+/* Locate only a bounded, self-contained uncompressed question to echo in an
+ * error. Do not chase compression pointers or copy unvalidated extra records. */
+static size_t
+static_question_end (const uint8_t *query, size_t length)
+{
+    size_t offset = 12;
+    if (read_u16 (query + 4) != 1)
+        return 12;
+    while (offset < length) {
+        unsigned label = query[offset++];
+        if (!label)
+            return offset - 12 <= 255 && length - offset >= 4 ? offset + 4 : 12;
+        if (label > 63 || label > length - offset || offset + label - 12 > 254)
+            return 12;
+        offset += label;
+    }
+    return 12;
+}
+
 int
 hev_mapped_dns_handle (HevMappedDNS *self, void *req, int qlen, void *res,
                        int slen)
@@ -188,6 +237,47 @@ hev_mapped_dns_handle (HevMappedDNS *self, void *req, int qlen, void *res,
     int ipn = 0;
     int off;
     int i;
+
+    if (!self || !req || !res || qlen < 0 || slen < 0)
+        return -1;
+
+    if (self->policy.name[0]) {
+        size_t length;
+        HevMappedDNSStaticResult result;
+        unsigned rcode;
+
+        if (((uintptr_t)res >= (uintptr_t)req &&
+             (uintptr_t)res - (uintptr_t)req < (size_t)qlen) ||
+            ((uintptr_t)req > (uintptr_t)res &&
+             (uintptr_t)req - (uintptr_t)res < (size_t)slen))
+            return -1;
+        result = hev_mapped_dns_static_reply (&self->policy, req, qlen, res,
+                                              slen, &length);
+        if (result == HEV_MAPPED_DNS_STATIC_REPLY)
+            return (int)length;
+        /* Experimental UDP endpoint, not an upstream resolver. Return
+         * FORMERR / NOTIMP / REFUSED instead of silently turning PASS or
+         * UNSUPPORTED into a timeout. Never answer an incoming reply.
+         * Caller provides separate request/response buffers. */
+        if (qlen < 12 || qlen > 4096 || slen < 12 || (rb[2] & 0x80) ||
+            result == HEV_MAPPED_DNS_STATIC_NO_SPACE)
+            return -1;
+        rcode = result == HEV_MAPPED_DNS_STATIC_PASS ? 5 :
+                result == HEV_MAPPED_DNS_STATIC_UNSUPPORTED ? 4 : 1;
+        if (read_u16 (rb + 2) & 0x7800)
+            rcode = 4; /* Unsupported opcode. */
+        length = static_question_end (rb, qlen);
+        if (length > (size_t)slen)
+            return -1;
+        memset (sb, 0, 12);
+        memcpy (sb, rb, 2);
+        write_u16 (sb + 2, 0x8000 | (read_u16 (rb + 2) & 0x7910) | rcode);
+        if (length > 12) {
+            write_u16 (sb + 4, 1);
+            memcpy (sb + 12, rb + 12, length - 12);
+        }
+        return (int)length;
+    }
 
     if (slen < qlen)
         return -1;
@@ -263,6 +353,12 @@ hev_mapped_dns_lookup (HevMappedDNS *self, int ip)
 {
     HevMappedDNSNode *node;
     int idx;
+
+    if (self->policy.name[0]) {
+        uint32_t address = htonl ((uint32_t)ip);
+        return hev_mapped_dns_static_lookup (&self->policy,
+                                             (const uint8_t *)&address);
+    }
 
     if ((ip & self->mask) != self->net)
         return NULL;

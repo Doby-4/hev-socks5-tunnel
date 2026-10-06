@@ -8,6 +8,8 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <lwip/tcp.h>
@@ -36,6 +38,8 @@ static int mapdns_port;
 static int mapdns_network;
 static int mapdns_netmask;
 static int mapdns_cache_size;
+static HevMappedDNSStatic mapdns_static;
+static int mapdns_seen;
 
 static char log_file[1024];
 static char pid_file[1024];
@@ -277,42 +281,100 @@ static int
 hev_config_parse_mapdns (yaml_document_t *doc, yaml_node_t *base)
 {
     yaml_node_pair_t *pair;
+    const char *domain = NULL;
+    uint8_t address[4] = { 0 };
+    unsigned seen = 0;
 
-    if (!base || YAML_MAPPING_NODE != base->type)
+    if (!base || YAML_MAPPING_NODE != base->type || mapdns_seen)
         return -1;
+    mapdns_seen = 1;
 
     for (pair = base->data.mapping.pairs.start;
          pair < base->data.mapping.pairs.top; pair++) {
         yaml_node_t *node;
         const char *key, *value;
+        unsigned bit;
+        char *end;
+        unsigned long number;
 
         if (!pair->key || !pair->value)
             continue;
 
         node = yaml_document_get_node (doc, pair->key);
-        if (!node || YAML_SCALAR_NODE != node->type)
-            break;
+        if (!node || YAML_SCALAR_NODE != node->type ||
+            strlen ((const char *)node->data.scalar.value) != node->data.scalar.length)
+            return -1;
         key = (const char *)node->data.scalar.value;
 
         node = yaml_document_get_node (doc, pair->value);
-        if (!node || YAML_SCALAR_NODE != node->type)
-            break;
+        if (!node || YAML_SCALAR_NODE != node->type ||
+            strlen ((const char *)node->data.scalar.value) != node->data.scalar.length)
+            return -1;
         value = (const char *)node->data.scalar.value;
 
-        if (0 == strcmp (key, "address"))
-            inet_pton (AF_INET, value, &mapdns_address);
-        else if (0 == strcmp (key, "port"))
-            mapdns_port = strtoul (value, NULL, 10);
-        else if (0 == strcmp (key, "network"))
-            inet_pton (AF_INET, value, &mapdns_network);
-        else if (0 == strcmp (key, "netmask"))
-            inet_pton (AF_INET, value, &mapdns_netmask);
-        else if (0 == strcmp (key, "cache-size"))
-            mapdns_cache_size = strtoul (value, NULL, 10);
+        if (0 == strcmp (key, "address")) {
+            bit = 1;
+            if (inet_pton (AF_INET, value, &mapdns_address) != 1)
+                return -1;
+        } else if (0 == strcmp (key, "port")) {
+            bit = 2;
+            number = strtoul (value, &end, 10);
+            if (value[0] < '0' || value[0] > '9' || *end || !number || number > 65535)
+                return -1;
+            mapdns_port = number;
+        } else if (0 == strcmp (key, "network")) {
+            bit = 4;
+            if (inet_pton (AF_INET, value, &mapdns_network) != 1)
+                return -1;
+        } else if (0 == strcmp (key, "netmask")) {
+            bit = 8;
+            if (inet_pton (AF_INET, value, &mapdns_netmask) != 1)
+                return -1;
+        } else if (0 == strcmp (key, "cache-size")) {
+            bit = 16;
+            number = strtoul (value, &end, 10);
+            if (value[0] < '0' || value[0] > '9' || *end || number > 0x7fffffffUL)
+                return -1;
+            mapdns_cache_size = number;
+        } else if (0 == strcmp (key, "static-domain")) {
+            bit = 32;
+            domain = value;
+        } else if (0 == strcmp (key, "static-address")) {
+            bit = 64;
+            if (inet_pton (AF_INET, value, address) != 1)
+                return -1;
+        } else {
+            return -1;
+        }
+        if (seen & bit)
+            return -1;
+        seen |= bit;
     }
 
     mapdns_network = ntohl (mapdns_network);
     mapdns_netmask = ntohl (mapdns_netmask);
+
+    if (seen & (32 | 64)) {
+        HevMappedDNSStatic next, dns_check;
+        uint32_t fake, dns = ntohl ((uint32_t)mapdns_address);
+        uint32_t mask = mapdns_netmask, net = mapdns_network, hostmask = ~mask;
+        const unsigned required = 1 | 2 | 4 | 8 | 32 | 64;
+        if ((seen & required) != required || mapdns_cache_size || !mask ||
+            (hostmask & (hostmask + 1)) || (net & hostmask) ||
+            hev_mapped_dns_static_init (&next, domain, address) < 0)
+            return -1;
+        memcpy (&fake, address, 4);
+        fake = ntohl (fake);
+        /* Reserve one subnet, including the DNS endpoint, against fallback.
+         * This checks local configuration only, not the device's other routes. */
+        if ((fake & mask) != net || (dns & mask) != net || fake == dns ||
+            fake == net || fake == (net | hostmask) ||
+            dns == net || dns == (net | hostmask) ||
+            hev_mapped_dns_static_init (&dns_check, domain,
+                                        (const uint8_t *)&mapdns_address) < 0)
+            return -1;
+        mapdns_static = next;
+    }
 
     return 0;
 }
@@ -479,6 +541,8 @@ hev_config_reset (void)
     mapdns_network = 0;
     mapdns_netmask = 0;
     mapdns_cache_size = 0;
+    memset (&mapdns_static, 0, sizeof (mapdns_static));
+    mapdns_seen = 0;
 
     max_session_count = 0;
     task_stack_size = 86016;
@@ -662,6 +726,12 @@ int
 hev_config_get_mapdns_cache_size (void)
 {
     return mapdns_cache_size;
+}
+
+const HevMappedDNSStatic *
+hev_config_get_mapdns_static (void)
+{
+    return mapdns_static.name[0] ? &mapdns_static : NULL;
 }
 
 int

@@ -51,6 +51,16 @@ socks5:
 # netmask: 255.192.0.0
   # Mapped DNS cache size
 # cache-size: 10000
+#
+# Experimental alternative to cache-size (do not combine with a nonzero cache).
+# Uses one immutable exact-domain mapping and reserves the whole network against
+# unknown-IP fallback. DNS address must be a different host in that network.
+# Example network: 198.18.0.0, netmask: 255.255.255.0, address: 198.18.0.1.
+# static-domain: df-test.dobytech.cn
+# static-address: 198.18.0.10
+# UDP only: matched IN/A -> Fake IP; misses -> REFUSED; unsupported -> NOTIMP.
+# DNS TCP is reset. No upstream DNS, no device routing or cache recovery.
+# This is a host-tested experiment, NOT yet suitable for enabling iOS DNS.
 
 #misc:
   # task stack size (bytes)

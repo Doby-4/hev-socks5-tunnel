@@ -10,6 +10,8 @@
 #ifndef __HEV_CONFIG_H__
 #define __HEV_CONFIG_H__
 
+#include "hev-mapped-dns-static.h"
+
 typedef struct _HevConfigServer HevConfigServer;
 
 struct _HevConfigServer
@@ -48,6 +50,7 @@ int hev_config_get_mapdns_port (void);
 int hev_config_get_mapdns_network (void);
 int hev_config_get_mapdns_netmask (void);
 int hev_config_get_mapdns_cache_size (void);
+const HevMappedDNSStatic *hev_config_get_mapdns_static (void);
 
 int hev_config_get_misc_task_stack_size (void);
 int hev_config_get_misc_tcp_buffer_size (void);
